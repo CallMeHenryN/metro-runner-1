@@ -1,0 +1,1115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Metro Runner</title>
+<meta name="description" content="Metro Runner — a 3-lane endless runner prototype. Swipe to jump, roll and dodge.">
+<meta name="theme-color" content="#1b2340">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<link rel="icon" href="data:,"><!-- empty favicon: avoids a 404 in the console -->
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #1b2340; overflow: hidden;
+    touch-action: none; overscroll-behavior: none;
+    -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+"use strict";
+
+// =====================================================================
+// CONFIG — all tunable settings live here
+// =====================================================================
+const CONFIG = {
+  // --- World ---
+  LANE_WIDTH: 1.8,          // world units between lane centres
+  DRAW_DISTANCE: 90,        // how far ahead we draw / spawn (world units)
+  FADE_LENGTH: 20,          // obstacles fade in over this distance at the far end
+  NEAR_Z: -3.3,             // nearest ground slice drawn (just in front of camera)
+  SLEEPER_SPACING: 1.6,
+  GRASS_BAND: 6,
+
+  // --- Speed curve ---
+  SPEED_START: 12,          // units/s
+  SPEED_MAX: 24,
+  SPEED_RAMP_TIME: 90,      // seconds to reach max (linear)
+
+  // --- Camera ---
+  CAM_HEIGHT: 5,
+  CAM_BACK: 4,
+  CAM_FOLLOW: 8,            // lane-follow stiffness (higher = less lag)
+  CAM_JUMP_FOLLOW: 0.3,     // how much the camera rises with a jump
+  FOCAL_W: 0.7,
+  FOCAL_H: 0.4,
+  PLAYER_SCREEN_Y: 0.8,
+  MAX_ASPECT: 9 / 16,
+  MAX_DPR: 2,
+
+  // --- Player moves ---
+  LANE_TWEEN: 0.15,         // s
+  JUMP_TIME: 0.6,           // s, full parabola
+  JUMP_HEIGHT: 1.5,         // units at the peak
+  ROLL_TIME: 0.6,           // s
+  FASTFALL_SPEED: 14,       // units/s when swiping down mid-air
+  RUN_ANIM: 1.1,            // leg-cycle radians per unit travelled
+
+  // --- Obstacles (colour = which dodge) ---
+  OBSTACLES: {
+    barrier: { width: 1.5, height: 0.7, depth: 0.4, color: "#e63946" },              // JUMP
+    // Overhead gantry: as tall as a train, with a clear gap underneath (roll under it)
+    bar:     { width: 1.7, bottom: 1.2, top: 3.0, depth: 0.6, color: "#ffd23f",
+               post: "#3a3f4b", band: "#1a1a2e" },                                    // ROLL
+    train:   { width: 1.6, height: 3.0, length: 12, color: "#1d3fbb" },               // CHANGE LANE
+  },
+  POOL_SIZE: 48,
+
+  // --- Generator ---
+  ROW_GAP_MIN: 0.95,        // s of reaction time between rows (x current speed)
+  ROW_GAP_MAX: 1.4,
+  TRAIN_CLEAR_TIME: 0.45,   // a lane counts as blocked until a train has been gone this long
+  SAFE_LANE_OBSTACLE: 0.35, // chance the guaranteed lane has a jump/roll obstacle in it
+  LANE_ODDS: { train: 0.35, barrier: 0.22, bar: 0.18 }, // rest = empty (other lanes)
+
+  // --- Scripted opening (one of each obstacle, middle lane) ---
+  TUTORIAL_START_Z: 35,
+  TUTORIAL_GAP_TIME: 1.8,   // s between tutorial rows
+  HINT_DISTANCE: 28,        // hint shows when its obstacle is this close
+
+  // --- Collision (forgiving: 80% of the stickman's visual width/depth) ---
+  // Standing height must exceed the gantry gap (1.2); rolling height must be below it.
+  HITBOX: { halfW: 0.24, halfD: 0.16, standH: 1.6, rollH: 0.8 },
+  SUBSTEP: 0.3,             // max world units moved per collision check (no tunnelling)
+
+  // --- Game states ---
+  RESTART_LOCKOUT: 0.8,     // s after game over before input can restart
+  BEST_KEY: "metroRunnerBest",
+
+  // --- Juice ---
+  VOLUME: 0.35,             // master volume for all generated sounds
+  PARTICLE_COUNT: 40,       // burst on game over
+  SHAKE_PX: 0.035,          // max camera shake, as a fraction of screen width
+  SHAKE_DECAY: 5,           // how fast the shake settles
+  FLASH_TIME: 0.15,         // white flash on impact
+  OVER_DELAY: 0.3,          // game-over panel waits this long (let the fall play)...
+  OVER_FADE: 0.35,          // ...then fades in over this long
+  FALL_TIME: 0.55,          // s for the stickman to topple over on a crash
+  FALL_ANGLE: 1.45,         // radians he tips over (~83°)
+  KNOCKBACK: 0.4,           // units he is pushed back toward the camera
+  LEAN: 0.2,                // stickman leans into lane changes
+
+  // --- Input ---
+  SWIPE_MIN: 30,
+  BUFFER_TIME: 0.25,
+  BUFFER_MAX: 3,
+
+  // --- Loop ---
+  MAX_DT: 0.05,
+
+  // --- Colours ---
+  COLORS: {
+    skyTop: "#5ab8ff", skyBottom: "#bfe8ff",
+    skyline: ["#e63946", "#1d3fbb", "#ffd23f", "#2bb673", "#ffffff"],
+    grassA: "#5cc85c", grassB: "#4fb54f",
+    trackBed: "#7d838c", laneA: "#9aa0a8", laneB: "#a7adb5",
+    sleeper: "#6b4a2f", rail: "#eef3f8",
+    limbs: "#1a1a2e", shirt: "#e63946", head: "#ffffff",
+    shadow: "rgba(0,0,0,0.25)",
+    window: "#cfeaff", stripe: "#ffffff",
+    hudText: "#ffffff", hudBg: "rgba(20,25,50,0.55)", hudOutline: "#1a1a2e",
+  },
+
+  DEBUG: false,             // true = input/FPS overlay and R key to reset
+};
+
+const C = CONFIG.COLORS;
+const L = CONFIG.LANE_WIDTH;
+const OB = CONFIG.OBSTACLES;
+
+// =====================================================================
+// CANVAS & PROJECTION
+// =====================================================================
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+let W = 0, H = 0, dpr = 1, focal = 0, horizonY = 0, centerX = 0;
+
+function resize() {
+  const vw = window.innerWidth, vh = window.innerHeight;
+  W = Math.min(vw, Math.round(vh * CONFIG.MAX_ASPECT));
+  H = vh;
+  dpr = Math.min(window.devicePixelRatio || 1, CONFIG.MAX_DPR);
+  canvas.width = Math.round(W * dpr);
+  canvas.height = Math.round(H * dpr);
+  canvas.style.width = W + "px";
+  canvas.style.height = H + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  focal = Math.min(W * CONFIG.FOCAL_W, H * CONFIG.FOCAL_H);
+  centerX = W / 2;
+  horizonY = H * CONFIG.PLAYER_SCREEN_Y - CONFIG.CAM_HEIGHT * focal / CONFIG.CAM_BACK;
+
+  // Gradients only change with screen size, so build them here, not every frame
+  skyGrad = ctx.createLinearGradient(0, 0, 0, horizonY);
+  skyGrad.addColorStop(0, C.skyTop);
+  skyGrad.addColorStop(1, C.skyBottom);
+  fogGrad = ctx.createLinearGradient(0, horizonY, 0, horizonY + H * 0.06);
+  fogGrad.addColorStop(0, C.skyBottom);
+  fogGrad.addColorStop(1, "rgba(191,232,255,0)");
+}
+let skyGrad = null, fogGrad = null;
+window.addEventListener("resize", resize);
+window.addEventListener("orientationchange", () => setTimeout(resize, 100));
+
+const cam = { x: 0, y: CONFIG.CAM_HEIGHT, z: -CONFIG.CAM_BACK };
+
+function project(x, y, z) {
+  const d = z - cam.z;
+  if (d < 0.1) return null;
+  const s = focal / d;
+  return { x: centerX + (x - cam.x) * s, y: horizonY - (y - cam.y) * s, s };
+}
+
+// Draw a polygon from a list of world points [x,y,z]
+function poly(points, color) {
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  for (let i = 0; i < points.length; i++) {
+    const p = project(points[i][0], points[i][1], points[i][2]);
+    if (!p) return;
+    if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+  }
+  ctx.closePath();
+  ctx.fill();
+}
+
+function groundQuad(x0, x1, z0, z1, color, y = 0) {
+  poly([[x0, y, z0], [x1, y, z0], [x1, y, z1], [x0, y, z1]], color);
+}
+
+// Lighten (f > 1) or darken (f < 1) a hex colour; cached
+const shadeCache = new Map();
+function shade(hex, f) {
+  const key = hex + f;
+  if (shadeCache.has(key)) return shadeCache.get(key);
+  const n = parseInt(hex.slice(1), 16);
+  const ch = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map((c) =>
+    Math.round(f >= 1 ? c + (255 - c) * (f - 1) : c * f));
+  const out = `rgb(${ch[0]},${ch[1]},${ch[2]})`;
+  shadeCache.set(key, out);
+  return out;
+}
+
+// Shaded box: only the faces the camera can see (side, top, front)
+function drawBox(x0, x1, y0, y1, z0, z1, color) {
+  z0 = Math.max(z0, cam.z + 0.4);              // clip at near plane
+  if (z1 <= z0) return;
+  if (x0 > cam.x) poly([[x0, y0, z0], [x0, y1, z0], [x0, y1, z1], [x0, y0, z1]], shade(color, 0.7));
+  if (x1 < cam.x) poly([[x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [x1, y0, z1]], shade(color, 0.7));
+  if (y1 < cam.y) poly([[x0, y1, z0], [x1, y1, z0], [x1, y1, z1], [x0, y1, z1]], shade(color, 1.35));
+  poly([[x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0]], color);
+}
+
+// =====================================================================
+// GAME STATE
+// =====================================================================
+const player = {
+  lane: 0, x: 0,
+  tweening: false, tweenT: 0, fromX: 0, toX: 0,
+  y: 0, airborne: false, airT: 0, fastFall: false,
+  rollT: 0, rollAngle: 0,
+  phase: 0,
+  fallSide: 1, crashY: 0,   // crash animation
+};
+const state = {
+  mode: "start",            // "start" | "playing" | "over"
+  speed: CONFIG.SPEED_START, runTime: 0, distance: 0,
+  overTimer: 0, score: 0, best: loadBest(), newBest: false,
+  tutorialSeen: false,      // hints only until the player has cleared the opening once
+  clock: 0,                 // always-running time for UI pulses
+};
+
+function loadBest() {
+  try { return parseInt(localStorage.getItem(CONFIG.BEST_KEY), 10) || 0; } catch (e) { return 0; }
+}
+function saveBest(v) {
+  try { localStorage.setItem(CONFIG.BEST_KEY, String(v)); } catch (e) { /* storage blocked: ignore */ }
+}
+
+// Obstacle pool — objects are reused, never created during play
+const pool = [];
+for (let i = 0; i < CONFIG.POOL_SIZE; i++) {
+  pool.push({ active: false, type: "", lane: 0, z: 0, len: 0, hint: null });
+}
+const drawAhead = [], drawBehind = [];         // reused sort buffers
+
+// Generator state (z values are relative to the player and scroll with the world)
+const gen = { spawnZ: 0, prevSafe: 0, trainEnd: [-999, -999, -999], tutorialLast: null };
+
+// Debug info
+let lastAction = "-", flashAction = "", flashTimer = 0;
+let fps = 60, fpsAcc = 0, fpsFrames = 0;
+
+const skyline = [];
+(function buildSkyline() {
+  let x = -0.6, i = 0;
+  while (x < 1.6) {
+    const w = 0.05 + ((i * 37) % 7) / 100;
+    const h = 0.03 + ((i * 53) % 9) / 100;
+    skyline.push({ x, w, h, color: C.skyline[i % C.skyline.length] });
+    x += w + 0.01; i++;
+  }
+})();
+
+// =====================================================================
+// OBSTACLES & GENERATOR
+// =====================================================================
+const rand = (a, b) => a + Math.random() * (b - a);
+
+function spawn(type, lane, z, len) {
+  const o = pool.find((p) => !p.active);
+  if (!o) return null;                          // pool full: skip (should not happen)
+  o.active = true; o.type = type; o.lane = lane; o.z = z;
+  o.len = len !== undefined ? len : OB[type].depth;
+  o.hint = null;
+  return o;
+}
+
+// One row of obstacles. Guarantees a "safe" lane with no train, which is
+// never more than one lane away from the previous row's safe lane.
+function generateRow(z) {
+  const clear = state.speed * CONFIG.TRAIN_CLEAR_TIME;
+  const blocked = gen.trainEnd.map((end) => end > z - clear);
+
+  const cands = [];
+  for (let l = -1; l <= 1; l++) {
+    if (!blocked[l + 1] && Math.abs(l - gen.prevSafe) <= 1) cands.push(l);
+  }
+  // Invariant: the previous safe lane is always unblocked, so cands is never empty
+  const safe = cands.length ? cands[Math.floor(Math.random() * cands.length)] : gen.prevSafe;
+
+  for (let l = -1; l <= 1; l++) {
+    if (blocked[l + 1]) continue;               // a train is still running here
+    const r = Math.random();
+    if (l === safe) {
+      if (r < CONFIG.SAFE_LANE_OBSTACLE) spawn(Math.random() < 0.5 ? "barrier" : "bar", l, z);
+      continue;
+    }
+    const P = CONFIG.LANE_ODDS;
+    if (r < P.train) {
+      const len = OB.train.length;
+      spawn("train", l, z, len);
+      gen.trainEnd[l + 1] = z + len;
+    } else if (r < P.train + P.barrier) {
+      spawn("barrier", l, z);
+    } else if (r < P.train + P.barrier + P.bar) {
+      spawn("bar", l, z);
+    }
+  }
+  gen.prevSafe = safe;
+}
+
+// Scripted opening: jump, roll, then change lane — each with a hint
+function spawnTutorial() {
+  const gap = CONFIG.SPEED_START * CONFIG.TUTORIAL_GAP_TIME;
+  let z = CONFIG.TUTORIAL_START_Z;
+  spawn("barrier", 0, z).hint = { title: "↑  JUMP", sub: "swipe up  ·  ↑ key", color: OB.barrier.color };
+  z += gap;
+  spawn("bar", 0, z).hint = { title: "↓  ROLL", sub: "swipe down  ·  ↓ key", color: OB.bar.color };
+  z += gap;
+  const len = OB.train.length;
+  const last = spawn("train", 0, z, len);
+  last.hint = { title: "←  →  DODGE", sub: "swipe sideways  ·  ← → keys", color: OB.train.color };
+  gen.tutorialLast = last;
+  gen.trainEnd[1] = z + len;
+  gen.prevSafe = 0;
+  gen.spawnZ = z + len + CONFIG.SPEED_START * 1.2;
+}
+
+function resetRun() {
+  for (const o of pool) o.active = false;
+  state.speed = CONFIG.SPEED_START; state.runTime = 0; state.distance = 0;
+  Object.assign(player, {
+    lane: 0, x: 0, tweening: false, y: 0, airborne: false, fastFall: false, rollT: 0,
+  });
+  cam.x = 0;
+  gen.trainEnd = [-999, -999, -999];
+  inputQueue.length = 0;
+  for (const p of particles) p.life = 0;
+  fx.shake = 0; fx.flash = 0;
+  spawnTutorial();
+}
+
+// =====================================================================
+// SOUND — generated with Web Audio; starts on the first user gesture
+// =====================================================================
+let actx = null, master = null, noiseBuf = null;
+
+function initAudio() {
+  if (actx) { if (actx.state === "suspended") actx.resume(); return; }
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    actx = new AC();
+    master = actx.createGain();
+    master.gain.value = CONFIG.VOLUME;
+    master.connect(actx.destination);
+    // 1 s of white noise, reused for the crash
+    noiseBuf = actx.createBuffer(1, actx.sampleRate, actx.sampleRate);
+    const d = noiseBuf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  } catch (e) { actx = null; }
+}
+
+// Short tone with a soft attack/decay; optional pitch glide
+function tone(f0, f1, dur, type, vol, delay = 0) {
+  if (!actx || actx.state !== "running") return;
+  const t = actx.currentTime + delay;
+  const o = actx.createOscillator(), g = actx.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(f0, t);
+  if (f1) o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(vol, t + 0.012);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g); g.connect(master);
+  o.start(t); o.stop(t + dur + 0.05);
+}
+
+function noise(dur, vol, cutoff) {
+  if (!actx || actx.state !== "running" || !noiseBuf) return;
+  const t = actx.currentTime;
+  const src = actx.createBufferSource(), f = actx.createBiquadFilter(), g = actx.createGain();
+  src.buffer = noiseBuf;
+  f.type = "lowpass"; f.frequency.value = cutoff;
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  src.connect(f); f.connect(g); g.connect(master);
+  src.start(t); src.stop(t + dur + 0.05);
+}
+
+// Movement is silent by design; only start, crash and new-best make sound
+const SFX = {
+  start: () => { tone(440, null, 0.1, "sine", 0.35); tone(660, null, 0.14, "sine", 0.35, 0.09); },
+  crash: () => { noise(0.4, 0.6, 1200); tone(170, 45, 0.45, "sawtooth", 0.3); },
+  best:  () => [523, 659, 784, 1047].forEach((f, i) => tone(f, null, 0.16, "triangle", 0.3, 0.45 + i * 0.11)),
+};
+
+// =====================================================================
+// EFFECTS — particle burst, camera shake, impact flash
+// =====================================================================
+const fx = { shake: 0, flash: 0 };
+const particles = [];
+for (let i = 0; i < CONFIG.PARTICLE_COUNT; i++) {
+  particles.push({ life: 0, x: 0, y: 0, vx: 0, vy: 0, size: 0, rot: 0, vr: 0, color: "" });
+}
+const PARTICLE_COLORS = [...C.skyline, C.shirt];
+
+function burst(sx, sy, scale) {
+  for (const p of particles) {
+    const a = rand(0, Math.PI * 2), sp = rand(0.3, 1) * W * 0.9;
+    p.life = rand(0.5, 0.9);
+    p.x = sx; p.y = sy;
+    p.vx = Math.cos(a) * sp;
+    p.vy = Math.sin(a) * sp - W * 0.5;          // bias upward
+    p.size = rand(0.08, 0.18) * scale;
+    p.rot = rand(0, Math.PI); p.vr = rand(-12, 12);
+    p.color = PARTICLE_COLORS[Math.floor(Math.random() * PARTICLE_COLORS.length)];
+  }
+}
+
+function updateEffects(dt) {
+  fx.shake *= Math.exp(-CONFIG.SHAKE_DECAY * dt);
+  if (fx.shake < 0.01) fx.shake = 0;
+  if (fx.flash > 0) fx.flash = Math.max(0, fx.flash - dt);
+  for (const p of particles) {
+    if (p.life <= 0) continue;
+    p.life -= dt;
+    p.vy += W * 2.2 * dt;                       // gravity
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.rot += p.vr * dt;
+  }
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    if (p.life <= 0) continue;
+    ctx.globalAlpha = Math.min(1, p.life / 0.3);
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(p.rot);
+    ctx.fillStyle = p.color;
+    ctx.fillRect(-p.size / 2, -p.size / 2, p.size, p.size);
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+}
+
+// =====================================================================
+// INPUT — keyboard, touch and mouse (Pointer Events), with a buffer
+// =====================================================================
+const inputQueue = [];
+
+function queueAction(action) {
+  if (state.mode !== "playing") { handleStartOrRestart(); return; }
+  if (inputQueue.length >= CONFIG.BUFFER_MAX) inputQueue.shift();
+  inputQueue.push({ action, age: 0 });
+}
+
+const KEYMAP = {
+  ArrowLeft: "left", KeyA: "left",
+  ArrowRight: "right", KeyD: "right",
+  ArrowUp: "up", KeyW: "up", Space: "up",
+  ArrowDown: "down", KeyS: "down",
+};
+window.addEventListener("keydown", (e) => {
+  initAudio();
+  const action = KEYMAP[e.code];
+  if (action) {
+    e.preventDefault();
+    if (!e.repeat) queueAction(action);
+  } else if (e.code === "Enter") {
+    onTap();
+  } else if (e.code === "KeyR" && CONFIG.DEBUG) {
+    resetRun();
+    state.mode = "start";
+  }
+});
+
+let ptr = null;
+window.addEventListener("pointerdown", (e) => {
+  initAudio();
+  ptr = { id: e.pointerId, x: e.clientX, y: e.clientY, swiped: false };
+  e.preventDefault();
+}, { passive: false });
+
+window.addEventListener("pointermove", (e) => {
+  if (!ptr || e.pointerId !== ptr.id || ptr.swiped) return;
+  const dx = e.clientX - ptr.x, dy = e.clientY - ptr.y;
+  if (Math.hypot(dx, dy) >= CONFIG.SWIPE_MIN) {
+    ptr.swiped = true;
+    if (Math.abs(dx) > Math.abs(dy)) queueAction(dx > 0 ? "right" : "left");
+    else queueAction(dy > 0 ? "down" : "up");
+  }
+  e.preventDefault();
+}, { passive: false });
+
+window.addEventListener("pointerup", (e) => {
+  initAudio();                                  // iOS unlocks audio on touch end
+  if (ptr && e.pointerId === ptr.id && !ptr.swiped) onTap();
+  ptr = null;
+});
+window.addEventListener("pointercancel", () => { ptr = null; });
+
+document.addEventListener("touchmove", (e) => e.preventDefault(), { passive: false });
+document.addEventListener("gesturestart", (e) => e.preventDefault());
+document.addEventListener("dblclick", (e) => e.preventDefault());
+document.addEventListener("contextmenu", (e) => e.preventDefault());   // no long-press menu
+
+function onTap() {
+  setDebugAction("tap");
+  handleStartOrRestart();
+}
+
+// Start screen: any swipe/tap/key starts. Game over: same, after a short lockout.
+function handleStartOrRestart() {
+  if (state.mode === "start") {
+    state.mode = "playing";
+    inputQueue.length = 0;
+    SFX.start();
+  } else if (state.mode === "over" && state.overTimer >= CONFIG.RESTART_LOCKOUT) {
+    resetRun();
+    state.mode = "playing";
+    SFX.start();
+  }
+}
+
+function setDebugAction(a) {
+  lastAction = a; flashAction = a; flashTimer = 0.4;
+}
+
+function startJump() {
+  player.rollT = 0;                             // jumping cancels a roll
+  player.airborne = true; player.airT = 0; player.fastFall = false;
+}
+
+function startRoll() {
+  player.rollT = CONFIG.ROLL_TIME;
+}
+
+// Returns true if consumed, false to keep it in the buffer
+function tryAction(action) {
+  if (action === "left" || action === "right") {
+    if (player.tweening) return false;
+    const newLane = player.lane + (action === "left" ? -1 : 1);
+    if (newLane < -1 || newLane > 1) { setDebugAction(action + " (edge)"); return true; }
+    player.lane = newLane;
+    player.fromX = player.x; player.toX = newLane * L;
+    player.tweenT = 0; player.tweening = true;
+    setDebugAction(action);
+    return true;
+  }
+  if (action === "up") {
+    if (player.airborne) return false;          // buffered: jumps right after landing
+    startJump();
+    setDebugAction("up");
+    return true;
+  }
+  if (action === "down") {
+    if (player.airborne) player.fastFall = true; // drop fast, roll on landing
+    else startRoll();
+    setDebugAction("down");
+    return true;
+  }
+  return true;
+}
+
+function processInput(dt) {
+  for (const q of inputQueue) q.age += dt;
+  while (inputQueue.length && inputQueue[0].age > CONFIG.BUFFER_TIME) inputQueue.shift();
+  while (inputQueue.length && tryAction(inputQueue[0].action)) inputQueue.shift();
+}
+
+// =====================================================================
+// UPDATE
+// =====================================================================
+const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
+
+// Standard "bounce" ease: lands, then two small rebounds
+function easeOutBounce(t) {
+  const n = 7.5625, d = 2.75;
+  if (t < 1 / d) return n * t * t;
+  if (t < 2 / d) return n * (t -= 1.5 / d) * t + 0.75;
+  if (t < 2.5 / d) return n * (t -= 2.25 / d) * t + 0.9375;
+  return n * (t -= 2.625 / d) * t + 0.984375;
+}
+
+function updatePlayer(dt) {
+  // Lane tween
+  if (player.tweening) {
+    player.tweenT += dt / CONFIG.LANE_TWEEN;
+    const t = Math.min(1, player.tweenT);
+    player.x = player.fromX + (player.toX - player.fromX) * easeOutCubic(t);
+    if (t >= 1) player.tweening = false;
+  }
+
+  // Jump (parabola) / fast-fall
+  if (player.airborne) {
+    if (player.fastFall) {
+      player.y -= CONFIG.FASTFALL_SPEED * dt;
+      if (player.y <= 0) { player.y = 0; player.airborne = false; player.fastFall = false; startRoll(); }
+    } else {
+      player.airT += dt;
+      const t = player.airT / CONFIG.JUMP_TIME;
+      if (t >= 1) { player.y = 0; player.airborne = false; }
+      else player.y = 4 * CONFIG.JUMP_HEIGHT * t * (1 - t);
+    }
+  }
+
+  // Roll
+  if (player.rollT > 0) {
+    player.rollT = Math.max(0, player.rollT - dt);
+    player.rollAngle += dt * 14;
+  }
+
+  // Legs only cycle while on the ground
+  if (!player.airborne) player.phase += state.speed * dt * CONFIG.RUN_ANIM;
+}
+
+function updateWorld(dt) {
+  // Speed curve: linear ramp to max
+  state.runTime += dt;
+  const k = Math.min(1, state.runTime / CONFIG.SPEED_RAMP_TIME);
+  state.speed = CONFIG.SPEED_START + (CONFIG.SPEED_MAX - CONFIG.SPEED_START) * k;
+
+  const dz = state.speed * dt;
+  state.distance += dz;
+
+  // Move obstacles toward the camera; recycle once fully behind it
+  for (const o of pool) {
+    if (!o.active) continue;
+    o.z -= dz;
+    if (o.z + o.len < cam.z) o.active = false;
+  }
+  gen.spawnZ -= dz;
+  for (let i = 0; i < 3; i++) gen.trainEnd[i] -= dz;
+
+  // Spawn rows until the visible range is filled
+  while (gen.spawnZ < CONFIG.DRAW_DISTANCE) {
+    generateRow(gen.spawnZ);
+    gen.spawnZ += state.speed * rand(CONFIG.ROW_GAP_MIN, CONFIG.ROW_GAP_MAX);
+  }
+}
+
+// =====================================================================
+// COLLISION — axis-aligned boxes (AABB)
+// =====================================================================
+const obBox = { x0: 0, x1: 0, y0: 0, y1: 0 };   // reused, no allocation
+
+function obstacleBox(o) {
+  const c = o.lane * L;
+  if (o.type === "barrier") {
+    const t = OB.barrier;
+    obBox.x0 = c - t.width / 2; obBox.x1 = c + t.width / 2; obBox.y0 = 0; obBox.y1 = t.height;
+  } else if (o.type === "bar") {
+    const t = OB.bar;                            // only the panel; posts are decoration
+    obBox.x0 = c - t.width / 2; obBox.x1 = c + t.width / 2; obBox.y0 = t.bottom; obBox.y1 = t.top;
+  } else {
+    const t = OB.train;
+    obBox.x0 = c - t.width / 2; obBox.x1 = c + t.width / 2; obBox.y0 = 0; obBox.y1 = t.height;
+  }
+  return obBox;
+}
+
+function checkCollision() {
+  const hb = CONFIG.HITBOX;
+  const px0 = player.x - hb.halfW, px1 = player.x + hb.halfW;
+  const py0 = player.y, py1 = player.y + (player.rollT > 0 ? hb.rollH : hb.standH);
+  for (const o of pool) {
+    if (!o.active) continue;
+    if (o.z > hb.halfD || o.z + o.len < -hb.halfD) continue;     // depth (z) overlap
+    const b = obstacleBox(o);
+    if (px1 > b.x0 && px0 < b.x1 && py1 > b.y0 && py0 < b.y1) return o;
+  }
+  return null;
+}
+
+function gameOver() {
+  state.mode = "over";
+  state.overTimer = 0;
+  state.score = Math.floor(state.distance);
+  state.newBest = state.score > state.best;
+  if (state.newBest) { state.best = state.score; saveBest(state.best); }
+  inputQueue.length = 0;
+
+  // Juice: burst from the player's chest, shake, flash, sound
+  const chest = project(player.x, player.y + 1.0, 0);
+  if (chest) burst(chest.x, chest.y, chest.s);
+
+  // Fall direction: bounce away from a side impact; otherwise topple toward the
+  // outside of the track (random in the middle lane)
+  if (player.tweening) player.fallSide = player.toX > player.x ? -1 : 1;
+  else player.fallSide = player.lane !== 0 ? player.lane : (Math.random() < 0.5 ? -1 : 1);
+  player.crashY = player.y;
+  player.rollT = 0;                             // stand up into the fall pose
+  player.tweening = false;
+  fx.shake = 1;
+  fx.flash = CONFIG.FLASH_TIME;
+  SFX.crash();
+  if (state.newBest) SFX.best();
+}
+
+function update(dt) {
+  state.clock += dt;
+  if (flashTimer > 0) flashTimer -= dt;
+  updateEffects(dt);
+
+  if (state.mode === "playing") {
+    processInput(dt);
+    // Split the frame into small steps so fast obstacles can't skip past the player
+    const steps = Math.max(1, Math.ceil(state.speed * dt / CONFIG.SUBSTEP));
+    const h = dt / steps;
+    for (let i = 0; i < steps; i++) {
+      updatePlayer(h);
+      updateWorld(h);
+      if (checkCollision()) { gameOver(); break; }
+    }
+    // Opening cleared once: stop showing hints for the rest of the session
+    const t = gen.tutorialLast;
+    if (!state.tutorialSeen && t && t.active && t.z + t.len < 0) state.tutorialSeen = true;
+  } else if (state.mode === "over") {
+    state.overTimer += dt;
+  }
+
+  cam.x += (player.x - cam.x) * (1 - Math.exp(-CONFIG.CAM_FOLLOW * dt));
+  cam.y = CONFIG.CAM_HEIGHT + player.y * CONFIG.CAM_JUMP_FOLLOW;
+}
+
+// =====================================================================
+// RENDER
+// =====================================================================
+const BLEED = 60;   // draw backgrounds past the edges so camera shake never shows gaps
+
+function drawSky() {
+  ctx.fillStyle = skyGrad;
+  ctx.fillRect(-BLEED, -BLEED, W + BLEED * 2, horizonY + BLEED + 1);
+  const shift = -cam.x * focal * 0.02;
+  for (const b of skyline) {
+    ctx.fillStyle = b.color;
+    const bh = b.h * H;
+    ctx.fillRect(b.x * W + shift, horizonY - bh, b.w * W, bh);
+  }
+}
+
+function drawGround() {
+  const far = CONFIG.DRAW_DISTANCE, near = CONFIG.NEAR_Z;
+  const half = 1.5 * L + 0.5;
+  const dist = state.distance;
+
+  ctx.fillStyle = C.grassA;
+  ctx.fillRect(-BLEED, horizonY, W + BLEED * 2, H - horizonY + BLEED);
+  const band = CONFIG.GRASS_BAND;
+  const off = dist % (band * 2);
+  for (let z = far - ((far + off) % (band * 2)); z > near - band * 2; z -= band * 2) {
+    const z0 = Math.max(near, z), z1 = Math.min(far, z + band);
+    if (z1 <= z0) continue;
+    groundQuad(-60, -half, z0, z1, C.grassB);
+    groundQuad(half, 60, z0, z1, C.grassB);
+  }
+
+  groundQuad(-half, half, near, far, C.trackBed);
+  for (let lane = -1; lane <= 1; lane++) {
+    const c = lane * L;
+    groundQuad(c - 0.75, c + 0.75, near, far, lane === 0 ? C.laneB : C.laneA);
+  }
+
+  const sp = CONFIG.SLEEPER_SPACING;
+  const start = far - ((far + dist) % sp);
+  for (let z = start; z > near; z -= sp) {
+    for (let lane = -1; lane <= 1; lane++) {
+      const c = lane * L;
+      groundQuad(c - 0.7, c + 0.7, z, z + 0.3, C.sleeper);
+    }
+  }
+
+  for (let lane = -1; lane <= 1; lane++) {
+    const c = lane * L;
+    groundQuad(c - 0.52, c - 0.44, near, far, C.rail, 0.02);
+    groundQuad(c + 0.44, c + 0.52, near, far, C.rail, 0.02);
+  }
+
+  ctx.fillStyle = fogGrad;
+  ctx.fillRect(-BLEED, horizonY, W + BLEED * 2, H * 0.06);
+}
+
+function drawObstacle(o) {
+  // Fade in at the far end
+  ctx.globalAlpha = Math.max(0, Math.min(1, (CONFIG.DRAW_DISTANCE - o.z) / CONFIG.FADE_LENGTH));
+  const c = o.lane * L;
+
+  if (o.type === "barrier") {
+    const t = OB.barrier, hw = t.width / 2;
+    drawBox(c - hw, c + hw, 0, t.height, o.z, o.z + o.len, t.color);
+    // White warning stripe on the front face
+    if (o.z > cam.z + 0.4) {
+      poly([[c - hw, 0.28, o.z], [c + hw, 0.28, o.z], [c + hw, 0.42, o.z], [c - hw, 0.42, o.z]], C.stripe);
+    }
+  } else if (o.type === "bar") {
+    const t = OB.bar, hw = t.width / 2;
+    drawBox(c - hw, c - hw + 0.12, 0, t.top, o.z, o.z + o.len, t.post);     // left post
+    drawBox(c + hw - 0.12, c + hw, 0, t.top, o.z, o.z + o.len, t.post);     // right post
+    drawBox(c - hw, c + hw, t.bottom, t.top, o.z, o.z + o.len, t.color);    // the panel
+    // Dark hazard band along the bottom edge highlights the gap to roll under
+    if (o.z > cam.z + 0.4) {
+      const b = t.bottom;
+      poly([[c - hw, b, o.z], [c + hw, b, o.z], [c + hw, b + 0.25, o.z], [c - hw, b + 0.25, o.z]], t.band);
+    }
+  } else if (o.type === "train") {
+    const t = OB.train, hw = t.width / 2;
+    const z0 = o.z, z1 = o.z + o.len;
+    drawBox(c - hw, c + hw, 0.1, t.height, z0, z1, t.color);
+    // Side windows on whichever side faces the camera
+    const sideX = c - hw > cam.x ? c - hw : (c + hw < cam.x ? c + hw : null);
+    if (sideX !== null) {
+      for (let wz = z0 + 1.2; wz + 1.4 < z1; wz += 2.4) {
+        if (wz < cam.z + 0.4) continue;
+        poly([[sideX, 1.7, wz], [sideX, 2.5, wz], [sideX, 2.5, wz + 1.4], [sideX, 1.7, wz + 1.4]], C.window);
+      }
+    }
+    // Front: windscreen and stripe
+    if (z0 > cam.z + 0.4) {
+      poly([[c - 0.55, 1.7, z0], [c + 0.55, 1.7, z0], [c + 0.55, 2.6, z0], [c - 0.55, 2.6, z0]], C.window);
+      poly([[c - hw, 0.9, z0], [c + hw, 0.9, z0], [c + hw, 1.1, z0], [c - hw, 1.1, z0]], C.stripe);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function line(p, q, width, color) {
+  if (!p || !q) return;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width;
+  ctx.beginPath();
+  ctx.moveTo(p.x, p.y);
+  ctx.lineTo(q.x, q.y);
+  ctx.stroke();
+}
+
+function drawShadow() {
+  const sh = project(player.x, 0, 0);
+  if (!sh) return null;
+  const shrink = 1 / (1 + player.y * 0.5);     // smaller shadow when higher
+  ctx.fillStyle = C.shadow;
+  ctx.beginPath();
+  ctx.ellipse(sh.x, sh.y, 0.45 * sh.s * shrink, 0.16 * sh.s * shrink, 0, 0, Math.PI * 2);
+  ctx.fill();
+  return sh;
+}
+
+// Rolling: curled-up ball spinning forward
+function drawRollBall(sh) {
+  const centre = project(player.x, 0.42 + player.y, 0);
+  if (!centre) return;
+  const r = 0.42 * centre.s;
+  const a = player.rollAngle;
+  ctx.fillStyle = C.shirt;
+  ctx.strokeStyle = C.limbs;
+  ctx.lineWidth = 0.08 * centre.s;
+  ctx.beginPath(); ctx.arc(centre.x, centre.y, r, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  // Spinning limb lines
+  for (let i = 0; i < 2; i++) {
+    const ang = a + i * Math.PI / 2;
+    ctx.beginPath();
+    ctx.moveTo(centre.x - Math.cos(ang) * r * 0.8, centre.y - Math.sin(ang) * r * 0.8);
+    ctx.lineTo(centre.x + Math.cos(ang) * r * 0.8, centre.y + Math.sin(ang) * r * 0.8);
+    ctx.stroke();
+  }
+  // Head on the rim
+  ctx.fillStyle = C.head;
+  ctx.beginPath();
+  ctx.arc(centre.x + Math.cos(a) * r * 0.7, centre.y + Math.sin(a) * r * 0.7, r * 0.38, 0, Math.PI * 2);
+  ctx.fill(); ctx.stroke();
+}
+
+// Stickman seen from behind; joints built in 3D then projected
+function drawPlayer() {
+  const sh = drawShadow();
+  if (player.rollT > 0) { drawRollBall(sh); return; }
+
+  const px = player.x;
+  const ph = player.phase;
+  const crashed = state.mode === "over";
+  const inAir = player.airborne && !crashed;
+  const bob = inAir || crashed ? 0 : Math.abs(Math.cos(ph)) * 0.06;
+  // Lean the upper body into a lane change (more lean higher up the body)
+  const lean = player.tweening ? (player.toX - player.x) * CONFIG.LEAN : 0;
+
+  // Crash: topple sideways around the feet with a small bounce, pushed back
+  // slightly; if he was in the air he drops to the ground while falling
+  let rot = 0, yOff = player.y, kb = 0;
+  if (crashed) {
+    const t = Math.min(1, state.overTimer / CONFIG.FALL_TIME);
+    rot = easeOutBounce(t) * CONFIG.FALL_ANGLE * player.fallSide;
+    yOff = player.crashY * (1 - Math.min(1, t * 1.8));
+    kb = easeOutCubic(t) * CONFIG.KNOCKBACK;
+  }
+  const cr = Math.cos(rot), sr = Math.sin(rot);
+  const P = (x, y, z) => {
+    const lx = x + lean * Math.max(0, y - 0.9), ly = y + bob;
+    return project(px + lx * cr + ly * sr, -lx * sr + ly * cr + yOff, z - kb);
+  };
+  const hipY = 0.95, shY = 1.45, legLen = 0.48;
+  const lw = 0.09 * (sh ? sh.s : 20);
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+
+  for (const side of [-1, 1]) {
+    const a = crashed ? side * 0.25 : Math.sin(ph) * side;          // crash: legs splayed
+    const thigh = a * 0.7;
+    const bend = crashed ? 0.15 : inAir ? 1.1 : 0.3 + 0.7 * (1 - a) / 2;   // tuck legs in the air
+    const shin = thigh - bend;
+    const hx = side * 0.12;
+    const knee = [hx, hipY - legLen * Math.cos(thigh), legLen * Math.sin(thigh)];
+    const foot = [hx, knee[1] - legLen * Math.cos(shin), knee[2] + legLen * Math.sin(shin)];
+    line(P(hx, hipY, 0), P(...knee), lw, C.limbs);
+    line(P(...knee), P(...foot), lw, C.limbs);
+  }
+
+  line(P(0, hipY, 0), P(0, shY + 0.05, 0.08), lw * 1.8, C.shirt);
+
+  for (const side of [-1, 1]) {
+    const sx = side * 0.2;
+    const sho = [sx, shY, 0.07];
+    if (inAir || crashed) {                     // arms up while jumping / flung out in a crash
+      const hand = [sx + side * 0.25, shY + 0.5, 0.1];
+      line(P(...sho), P(...hand), lw, C.limbs);
+      continue;
+    }
+    const a = -Math.sin(ph) * side;
+    const upper = a * 0.8;
+    const fore = upper + 1.0;
+    const elb = [sx + side * 0.05, shY - 0.32 * Math.cos(upper), 0.07 + 0.32 * Math.sin(upper)];
+    const hand = [elb[0], elb[1] - 0.28 * Math.cos(fore), elb[2] + 0.28 * Math.sin(fore)];
+    line(P(...sho), P(...elb), lw, C.limbs);
+    line(P(...elb), P(...hand), lw, C.limbs);
+  }
+
+  const head = P(0, 1.72, 0.1);
+  if (head) {
+    ctx.fillStyle = C.head;
+    ctx.strokeStyle = C.limbs;
+    ctx.lineWidth = lw * 0.6;
+    ctx.beginPath();
+    ctx.arc(head.x, head.y, 0.17 * head.s, 0, Math.PI * 2);
+    ctx.fill(); ctx.stroke();
+  }
+}
+
+// Painter's order. Lanes never overlap sideways, so lanes farther from the
+// camera are drawn first (their inner walls sit behind nearer-lane boxes),
+// then far-to-near within a lane. Player goes between "ahead" and "behind".
+function drawOrder(a, b) {
+  const da = Math.abs(a.lane * L - cam.x), db = Math.abs(b.lane * L - cam.x);
+  if (Math.abs(da - db) > 0.01) return db - da;
+  return b.z - a.z;
+}
+
+function drawScene() {
+  drawAhead.length = 0; drawBehind.length = 0;
+  for (const o of pool) {
+    if (!o.active || o.z > CONFIG.DRAW_DISTANCE) continue;
+    (o.z + o.len > 0 ? drawAhead : drawBehind).push(o);
+  }
+  drawAhead.sort(drawOrder);
+  drawBehind.sort(drawOrder);
+  for (const o of drawAhead) drawObstacle(o);
+  drawPlayer();
+  for (const o of drawBehind) drawObstacle(o);
+}
+
+function outlinedText(text, x, y, size, fill) {
+  ctx.font = `900 ${size}px system-ui, sans-serif`;
+  ctx.textAlign = "center";
+  ctx.lineJoin = "round";
+  ctx.lineWidth = size * 0.16;
+  ctx.strokeStyle = C.hudOutline;
+  ctx.strokeText(text, x, y);
+  ctx.fillStyle = fill;
+  ctx.fillText(text, x, y);
+  ctx.textAlign = "left";
+}
+
+// Tutorial hint for the nearest hinted obstacle
+function drawHint() {
+  if (state.mode !== "playing" || state.tutorialSeen) return;
+  for (const o of pool) {
+    if (!o.active || !o.hint) continue;
+    if (o.z > CONFIG.HINT_DISTANCE || o.z + o.len < -0.5) continue;
+    const pulse = 1 + 0.06 * Math.sin(state.clock * 10);
+    outlinedText(o.hint.title, W / 2, H * 0.3, Math.round(W * 0.11 * pulse), o.hint.color);
+    outlinedText(o.hint.sub, W / 2, H * 0.3 + W * 0.08, Math.round(W * 0.045), C.hudText);
+    return;
+  }
+}
+
+function drawHUD() {
+  if (state.mode !== "playing") return;
+  outlinedText(`${Math.floor(state.distance)} m`, W / 2, H * 0.1, Math.round(W * 0.09), C.hudText);
+}
+
+function dim(alpha = 0.5) {
+  ctx.fillStyle = `rgba(20,25,50,${alpha})`;
+  ctx.fillRect(0, 0, W, H);
+}
+
+function drawStartScreen() {
+  dim();
+  const s = W;
+  outlinedText("METRO", W / 2, H * 0.2, Math.round(s * 0.17), OB.barrier.color);
+  outlinedText("RUNNER", W / 2, H * 0.2 + s * 0.17, Math.round(s * 0.17), OB.bar.color);
+
+  // Colour legend: each colour = one move
+  const y0 = H * 0.2 + s * 0.34;
+  const fs = Math.round(s * 0.055);
+  outlinedText("↑  JUMP the red barriers", W / 2, y0, fs, OB.barrier.color);
+  outlinedText("↓  ROLL under yellow gantries", W / 2, y0 + fs * 1.6, fs, OB.bar.color);
+  outlinedText("← →  DODGE blue trains", W / 2, y0 + fs * 3.2, fs, shade(OB.train.color, 1.6));
+
+  const pulse = 1 + 0.05 * Math.sin(state.clock * 5);
+  outlinedText("SWIPE TO START", W / 2, H * 0.72, Math.round(s * 0.09 * pulse), C.hudText);
+  outlinedText("or tap / press an arrow key", W / 2, H * 0.72 + s * 0.07, Math.round(s * 0.042), C.hudText);
+  if (state.best > 0) {
+    outlinedText(`Best: ${state.best} m`, W / 2, H * 0.72 + s * 0.16, Math.round(s * 0.05), OB.bar.color);
+  }
+}
+
+function drawGameOver() {
+  // Fade in so the crash itself is visible first
+  const k = Math.max(0, Math.min(1, (state.overTimer - CONFIG.OVER_DELAY) / CONFIG.OVER_FADE));
+  dim(0.5 * k);
+  ctx.globalAlpha = k;
+  drawGameOverText();
+  ctx.globalAlpha = 1;
+}
+
+function drawGameOverText() {
+  const s = W;
+  outlinedText("GAME OVER", W / 2, H * 0.28, Math.round(s * 0.13), OB.barrier.color);
+  outlinedText(`${state.score} m`, W / 2, H * 0.28 + s * 0.2, Math.round(s * 0.16), C.hudText);
+  if (state.newBest) {
+    outlinedText("NEW BEST!", W / 2, H * 0.28 + s * 0.31, Math.round(s * 0.07), OB.bar.color);
+  } else {
+    outlinedText(`Best: ${state.best} m`, W / 2, H * 0.28 + s * 0.31, Math.round(s * 0.06), OB.bar.color);
+  }
+  if (state.overTimer >= CONFIG.RESTART_LOCKOUT) {
+    const pulse = 1 + 0.05 * Math.sin(state.clock * 5);
+    outlinedText("TAP TO RESTART", W / 2, H * 0.72, Math.round(s * 0.085 * pulse), C.hudText);
+  }
+}
+
+function drawDebug() {
+  if (!CONFIG.DEBUG) return;
+  ctx.font = "12px monospace";
+  const text = `lane ${player.lane} last:${lastAction} q:${inputQueue.length} spd:${state.speed.toFixed(1)} fps:${fps}`;
+  ctx.fillStyle = C.hudBg;
+  ctx.fillRect(6, H - 28, ctx.measureText(text).width + 12, 22);
+  ctx.fillStyle = C.hudText;
+  ctx.fillText(text, 12, H - 13);
+}
+
+function render() {
+  ctx.clearRect(0, 0, W, H);
+
+  // World layer (shakes)
+  ctx.save();
+  if (fx.shake > 0) {
+    const m = W * CONFIG.SHAKE_PX * fx.shake;
+    ctx.translate(rand(-m, m), rand(-m, m));
+  }
+  drawSky();
+  drawGround();
+  drawScene();
+  drawParticles();
+  ctx.restore();
+
+  // Impact flash
+  if (fx.flash > 0) {
+    ctx.fillStyle = `rgba(255,255,255,${0.6 * fx.flash / CONFIG.FLASH_TIME})`;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  // UI layer (steady)
+  drawHint();
+  drawHUD();
+  if (state.mode === "start") drawStartScreen();
+  else if (state.mode === "over") drawGameOver();
+  drawDebug();
+}
+
+// =====================================================================
+// MAIN LOOP — delta time, frame-rate independent
+// =====================================================================
+let lastTime = performance.now();
+function frame(now) {
+  let dt = (now - lastTime) / 1000;
+  lastTime = now;
+  dt = Math.min(dt, CONFIG.MAX_DT);
+  fpsAcc += dt; fpsFrames++;
+  if (fpsAcc >= 0.5) { fps = Math.round(fpsFrames / fpsAcc); fpsAcc = 0; fpsFrames = 0; }
+  update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+
+resize();
+resetRun();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
